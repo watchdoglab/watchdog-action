@@ -6,38 +6,108 @@ branding:
   color: orange
 
 inputs:
-  anthropic_api_key:
-    description: Anthropic API key. Store it as a repository secret.
-    required: true
-  github_token:
-    description: Token used to post review comments.
+  engine:
+    description: Which AI runs the review. "claude" (default), "codex" (OpenAI / ChatGPT) or "gemini" (Google).
     required: false
-    default: ${{ github.token }}
+    default: claude
   dogs:
     description: Which review to run, e.g. "all", "web", "api", "auth", "ai-app", "secrets". Maps to /watchdog-go-<dogs>.
     required: false
     default: all
   model:
-    description: Claude model to use.
+    description: Model ID. Empty uses the engine's default. Use the ID your provider expects.
     required: false
-    default: claude-sonnet-5-5
+    default: ''
   min_severity:
     description: Lowest severity to comment on (critical, high, medium, low).
     required: false
     default: medium
+  github_token:
+    description: Token used to post review comments.
+    required: false
+    default: ${{ github.token }}
+
+  # engine: claude
+  provider:
+    description: Where Claude Code gets its model. "anthropic" (default), "bedrock", "vertex" or "openrouter". For bedrock/vertex, sign in to the cloud in an earlier step.
+    required: false
+    default: anthropic
+  anthropic_api_key:
+    description: Anthropic API key.
+    required: false
+  claude_code_oauth_token:
+    description: Claude Pro/Max subscription token (from `claude setup-token`), instead of an API key.
+    required: false
+  openrouter_api_key:
+    description: OpenRouter API key, for provider "openrouter" (GPT, Gemini, Grok, DeepSeek, Qwen and more through Claude Code).
+    required: false
+
+  # engine: codex
+  openai_api_key:
+    description: OpenAI API key.
+    required: false
+  codex_auth_json:
+    description: Contents of ~/.codex/auth.json from `codex login` with a ChatGPT plan. Advanced; private repos only.
+    required: false
+
+  # engine: gemini
+  gemini_api_key:
+    description: Gemini API key from Google AI Studio.
+    required: false
+  gemini_auth:
+    description: Gemini sign-in. "api_key" (default), "vertex" or "code_assist" (Gemini Code Assist plan). vertex/code_assist need the gcp_* inputs.
+    required: false
+    default: api_key
+  gcp_workload_identity_provider:
+    description: Google Cloud Workload Identity Provider, for vertex or code_assist.
+    required: false
+  gcp_project_id:
+    description: Google Cloud project ID, for vertex or code_assist.
+    required: false
+  gcp_location:
+    description: Google Cloud region, for vertex.
+    required: false
+    default: global
+  gcp_service_account:
+    description: Google Cloud service account email, for vertex or code_assist.
+    required: false
 
 runs:
   using: composite
   steps:
-    - uses: anthropics/claude-code-action@v1
+    - id: prepare
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        ENGINE: ${{ inputs.engine }}
+        DOGS: ${{ inputs.dogs }}
+        MIN_SEVERITY: ${{ inputs.min_severity }}
+        ACTION_PATH: ${{ github.action_path }}
+        CODEX_AUTH_JSON: ${{ inputs.codex_auth_json }}
+      run: |
+        case "$ENGINE" in claude|codex|gemini) ;; *) echo "engine must be claude, codex or gemini" >&2; exit 1;; esac
+        case "$MIN_SEVERITY" in critical|high|medium|low) ;; *) echo "invalid min_severity" >&2; exit 1;; esac
+        "$ACTION_PATH/scripts/prepare.sh"
+
+    # ---- Claude Code: Watchdog plugin loaded natively, comments posted by Claude ----
+    - if: inputs.engine == 'claude'
+      uses: anthropics/claude-code-action@v1
+      env:
+        ANTHROPIC_BASE_URL: ${{ inputs.provider == 'openrouter' && 'https://openrouter.ai/api' || '' }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.provider == 'openrouter' && inputs.openrouter_api_key || '' }}
       with:
-        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        anthropic_api_key: ${{ inputs.provider == 'openrouter' && inputs.openrouter_api_key || inputs.anthropic_api_key }}
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        use_bedrock: ${{ inputs.provider == 'bedrock' }}
+        use_vertex: ${{ inputs.provider == 'vertex' }}
         github_token: ${{ inputs.github_token }}
         plugin_marketplaces: https://github.com/watchdoglab/watchdog.git
         plugins: watchdog@watchdog
         track_progress: true
         claude_args: >-
-          --model ${{ inputs.model }}
+          ${{ inputs.model && format('--model {0}', inputs.model) || '' }}
           --max-turns 40
           --allowedTools "Read,Glob,Grep,Skill,Bash(git diff:*),Bash(git log:*),Bash(gh pr diff:*),Bash(gh pr view:*),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*)"
         prompt: |
@@ -62,3 +132,45 @@ runs:
              (a ```suggestion block when the fix fits on those lines).
           2. Then post one summary comment with `gh pr comment`: a short table of findings
              by severity, and a "Not checked" line. If nothing was found, say so in one line.
+
+    # ---- Codex: read-only sandbox, returns JSON findings ----
+    - if: inputs.engine == 'codex'
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ inputs.openai_api_key }}
+        codex-home: ${{ steps.prepare.outputs.codex_home }}
+        prompt-file: .watchdog/prompt.md
+        output-schema-file: ${{ github.action_path }}/findings.schema.json
+        output-file: .watchdog/findings.json
+        model: ${{ inputs.model }}
+        sandbox: read-only
+
+    # ---- Gemini CLI: read-only tools, returns JSON findings ----
+    - id: gemini
+      if: inputs.engine == 'gemini'
+      uses: google-github-actions/run-gemini-cli@v0
+      with:
+        gemini_api_key: ${{ inputs.gemini_api_key }}
+        use_vertex_ai: ${{ inputs.gemini_auth == 'vertex' }}
+        use_gemini_code_assist: ${{ inputs.gemini_auth == 'code_assist' }}
+        gcp_workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+        gcp_project_id: ${{ inputs.gcp_project_id }}
+        gcp_location: ${{ inputs.gcp_location }}
+        gcp_service_account: ${{ inputs.gcp_service_account }}
+        gemini_model: ${{ inputs.model }}
+        settings: |
+          {"tools": {"core": ["read_file", "read_many_files", "glob", "search_file_content", "list_directory"]}}
+        prompt: ${{ steps.prepare.outputs.prompt }}
+
+    # ---- Codex / Gemini: post the JSON findings as one PR review ----
+    - if: inputs.engine != 'claude'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        MIN_SEVERITY: ${{ inputs.min_severity }}
+        FINDINGS_FILE: ${{ inputs.engine == 'codex' && '.watchdog/findings.json' || '' }}
+        FINDINGS_TEXT: ${{ steps.gemini.outputs.summary }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: node "$ACTION_PATH/scripts/post-review.js"
