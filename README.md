@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="Watchdog PR Review" width="160"></p>
+
 # Watchdog PR Review
 
 Security review on every pull request by the [Watchdog](https://github.com/watchdoglab/watchdog) dogs. It leaves inline comments on risky lines with a fix, then one summary comment.
